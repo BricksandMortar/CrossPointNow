@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using Newtonsoft.Json.Linq;
 using Quartz;
 using Quartz.Util;
 using Rock;
@@ -119,9 +120,10 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
                                 {"Person", groupMember.Person},
                                 {"Schedule", selectedSchedule}
                             };
-
+                                recipient.AdditionalMergeValuesJson = String.Empty;
                                 recipients.Add( recipient );
                             }
+                            messagedCount++;
                         }
 
                         var communicationService = new CommunicationService(rockContext);
@@ -140,7 +142,7 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
                         communication.ReviewerPersonAliasId = sender.PrimaryAliasId;
                         communication.MediumData = new Dictionary<string, string>();
                         communication.SetMediumDataValue("Message", message);
-                        communication.SetMediumDataValue( "FromValue", fromGuid );
+                        communication.SetMediumDataValue( "FromValue", from.Id.ToString() );
                         communication.SetMediumDataValue("Subject", "From: " + sender.FullName);
                         communication.Recipients = recipients;
 
@@ -163,7 +165,7 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
 
                 context.Result =
                     string.Format(
-                        "{0} group members were messaged in the following group".PluralizeIf(descendentGroups.Count() > 1) +
+                        "{0} group members were attempted to be messaged in the following group".PluralizeIf(descendentGroups.Count() > 1) + " " +
                         string.Join(", ", descendentGroups.AsEnumerable()), messagedCount);
             }
 
@@ -172,5 +174,14 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
                 context.Result = "No group members messaged.";
             }
         }
+//
+//        private string BuildAdditionalMergeValues(CommunicationRecipient recipient)
+//        {
+//            var jArray = new JArray();
+//            foreach (var additionalMergeValue in recipient.AdditionalMergeValues)
+//            {
+//                
+//            }
+//        }
     }
 }
