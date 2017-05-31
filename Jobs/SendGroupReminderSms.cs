@@ -1,14 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
-using Newtonsoft.Json.Linq;
 using Quartz;
 using Quartz.Util;
 using Rock;
 using Rock.Attribute;
+using Rock.Communication;
 using Rock.Data;
 using Rock.Model;
 using Rock.Web.Cache;
+using Rock.Web.UI;
 
 namespace com.bricksandmortarstudio.CrosspointNow.Jobs
 {
@@ -17,8 +19,6 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
     [IntegerField("Look Ahead",
          "The number of days ahead a schedule should be considered for emailing. NOTE: If this job runs multiple times during this interval group members will receive multiple emails"
      , order: 6)]
-    [BooleanField("Save Communications", "Whether a communication record should be saved for emails sent via this job",
-         key: "IsSaved", order: 7)]
     [BooleanField("Ignore Group Locations Schedules",
          "If selected group location schedules won't be included when calculating scheduled groups", true,
          key: "IgnoreGroupLocations", order: 5)]
@@ -35,7 +35,6 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
             var rootGroupGuid = dataMap.GetString("RootGroup");
             var fromGuid = dataMap.GetString( "From" );
             var message = dataMap.GetString("Message");
-            var isSaved = dataMap.GetBooleanFromString( "IsSaved" );
 
             var lookAhead = dataMap.GetString("LookAhead");
             var addDays = Convert.ToDouble(lookAhead.AsInteger());
@@ -83,12 +82,25 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
                     .ToList();
             }
 
-
             if (descendentGroups.Any())
             {
+                var smsMedium = MediumContainer.GetComponent("Rock.Communication.Medium.Sms");
+                if (smsMedium == null || !smsMedium.IsActive)
+                {
+                    throw new Exception("SMS Medium is Inactive");
+                }
+                var transport = smsMedium.Transport;
+                if (transport == null || !transport.IsActive)
+                {
+                    throw new Exception("No valid SMS transport active");
+                }
+                
                 int messagedCount = 0;
+                var mergeFields = Rock.Lava.LavaHelper.GetCommonMergeFields( null );
+                var globalAttributes = GlobalAttributesCache.Read(rockContext);
+                string applicationRoot = globalAttributes.GetValue("PublicApplicationRoot");
+                string themeRoot = RockTheme.GetThemes().FirstOrDefault()?.RelativePath;
 
-                var recipients = new List<CommunicationRecipient>();
                 foreach (var group in descendentGroups)
                 {
 
@@ -103,62 +115,35 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
                         //Schedule to merge for lava. Pick the group schedule as a default and then the soonest nextstartdatetime otherwise
                         var selectedSchedule = group.Schedule ??
                                                group.GroupLocations.OrderBy(
-                                                       gl => gl.Schedules.FirstOrDefault().NextStartDateTime)
+                                                       gl =>
+                                                       {
+                                                           Debug.Assert(gl.Schedules != null, "gl.Schedules != null");
+                                                           return gl.Schedules.FirstOrDefault().NextStartDateTime;
+                                                       })
                                                    .FirstOrDefault(gl => gl.Schedules.Any())
                                                    .Schedules.FirstOrDefault();
 
                         foreach (var groupMember in groupMembers)
                         {
-                            if (groupMember.Person.PrimaryAliasId.HasValue)
+                            var number = groupMember.Person.PhoneNumbers.FirstOrDefault(
+                                   pn => pn.IsMessagingEnabled && pn.IsValid )?.NumberFormattedWithCountryCode;
+                            if ( !string.IsNullOrEmpty(number))
                             {
-                                var recipient = new CommunicationRecipient();
-                                recipient.PersonAliasId = groupMember.Person.PrimaryAliasId.Value;
-                                recipient.AdditionalMergeValues = new Dictionary<string, object>
-                            {
-                                {"Group", group},
-                                {"GroupMember", groupMember},
-                                {"Person", groupMember.Person},
-                                {"Schedule", selectedSchedule}
-                            };
-                                recipient.AdditionalMergeValuesJson = String.Empty;
-                                recipients.Add( recipient );
+                                    var extendedMergeFields = new Dictionary<string, object>
+                                    {
+                                        {"Group", group},
+                                        {"GroupMember", groupMember},
+                                        {"Person", groupMember.Person},
+                                        {"Schedule", selectedSchedule}
+                                    };
+                                    extendedMergeFields = extendedMergeFields.Union(mergeFields).ToDictionary( kvp => kvp.Key, kvp => kvp.Value );
+                                    var personalMessage = message.ResolveMergeFields(extendedMergeFields, enabledLavaCommands); 
+                                    var mediumData = new Dictionary<string, string>();
+                                    mediumData.Add( "FromValue", from.Id.ToString() );
+                                    mediumData.Add("Message", personalMessage);
+                                    transport.Send(mediumData, new List<string> { number }, applicationRoot, themeRoot );
+                                    messagedCount++;
                             }
-                            messagedCount++;
-                        }
-
-                        var communicationService = new CommunicationService(rockContext);
-
-                        var communication = new Communication();
-                        communication.SenderPersonAliasId = sender.PrimaryAliasId;
-
-                        communication.Subject = communication.Subject;
-                        communication.IsBulkCommunication = false;
-                        communication.MediumEntityTypeId = EntityTypeCache.Read( "Rock.Communication.Medium.Sms" ).Id; 
-                        communication.EnabledLavaCommands = enabledLavaCommands;
-
-                        communication.FutureSendDateTime = null;
-                        communication.Status = CommunicationStatus.Approved;
-                        communication.ReviewedDateTime = RockDateTime.Now;
-                        communication.ReviewerPersonAliasId = sender.PrimaryAliasId;
-                        communication.MediumData = new Dictionary<string, string>();
-                        communication.SetMediumDataValue("Message", message);
-                        communication.SetMediumDataValue( "FromValue", from.Id.ToString() );
-                        communication.SetMediumDataValue("Subject", "From: " + sender.FullName);
-                        communication.Recipients = recipients;
-
-                        communicationService.Add(communication);
-                        rockContext.SaveChanges();
-
-                        var medium = communication.Medium;
-                        if ( medium != null && medium.IsActive )
-                        {
-                            medium.Send( communication );
-                        }
-
-                        if (!isSaved)
-                        {
-                            communicationService.Delete( communication );
-                            rockContext.SaveChanges();
                         }
                     }
                 }
@@ -174,14 +159,5 @@ namespace com.bricksandmortarstudio.CrosspointNow.Jobs
                 context.Result = "No group members messaged.";
             }
         }
-//
-//        private string BuildAdditionalMergeValues(CommunicationRecipient recipient)
-//        {
-//            var jArray = new JArray();
-//            foreach (var additionalMergeValue in recipient.AdditionalMergeValues)
-//            {
-//                
-//            }
-//        }
     }
 }
